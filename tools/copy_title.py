@@ -1,17 +1,14 @@
 # Robot penyalin judul untuk GitHub Actions (berjalan di runner, token repo sendiri).
-# v2 (29 Okt 2026): header Referer/UA pada unduh langsung, coba-ulang per segmen,
-# rotasi kandidat provider antar-percobaan, playlist pendek ditolak saat resolusi, pekerja unduh 10.
-# v3 (29 Okt 2026): unggah per episode + resume dari isi repo — progres tidak hangus
-# bila run berhenti di tengah (kasus Vinland: 13 ep hilang karena gagal di ep14).
-# v4 (29 Okt 2026 malam): ambil playlist LANGSUNG dulu (Referer/UA), proxy Worker hanya
-# cadangan — terbukti resolusi kosong massal disebabkan playlist yang wajib lewat proxy
-# Worker padahal kuota Workers mati (429), sementara sumber & segmen bisa langsung.
-# v5 (30 Okt 2026): unggah via GIT PUSH, bukan Git Data API — gelombang gagal 403
-# (batas sekunder GitHub) selalu membunuh run v4 di langkah tree/commit/ref API,
-# sementara push git tidak melewati kuota tulis REST itu. Unduhan & resolusi sama
-# persis dengan v4. Repo diambil sebagai clone parsial (--filter=blob:none,
-# --depth 1, tanpa checkout) karena repo gudang sudah raksasa; indeks diisi dari
-# pohon HEAD (read-tree) dan resume dibaca dari ls-tree lokal — nol panggilan API.
+# v5.1 (30 Okt 2026): unggah via GIT PUSH dengan commit-tree — pohon baru dibangun
+# hanya di jalur berkas yang berubah (hash-object + mktree + commit-tree), TANPA
+# indeks repo. Pelajaran probe v5 (30 Okt 2026): git add/commit di atas indeks
+# clone parsial repo raksasa (80+ GB) menggantung >30 mnt sampai timeout, sesudah
+# unduhan sukses — v5.1 membuang langkah indeks itu seluruhnya.
+# v5 (30 Okt 2026): unggah via git push dari clone parsial (--filter=blob:none,
+# --depth 1, tanpa checkout), menggantikan Git Data API yang ditolak 403
+# (batas sekunder) di langkah tree/commit/ref. Unduhan & resolusi identik v4:
+# v4 (29 Okt 2026 malam): ambil playlist LANGSUNG dulu (Referer/UA), proxy Worker
+# cadangan; v3: resume per episode; v2: coba-ulang per segmen, rotasi kandidat.
 # Masukan lewat env: WID, SLUG_ID, ANILIST_ID, TOTAL_EPS, TITLE_NAME, GH_TOKEN, GH_REPO.
 import json, os, shutil, subprocess, sys, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +22,7 @@ TOKEN = os.environ['GH_TOKEN']; REPO = os.environ['GH_REPO']
 OUT = os.path.join(os.getcwd(), 'work', WID)
 REPO_DIR = os.path.join(os.getcwd(), 'repo')
 DIRECT_OK = {'v': None}  # None=belum tahu, True=langsung bisa, False=wajib proxy
+HEAD_NOW = {'sha': None}  # commit induk berjalan; diperbarui sesudah tiap push sukses
 
 def log(*a): print(time.strftime('%H:%M:%S'), *a, flush=True)
 
@@ -193,17 +191,17 @@ def download_episode(slug_id, num, outdir):
     log(f'  ep{num}: {len(groups)} potongan besar, {sum(chunk_durs):.0f} dtk OK')
     return True
 
-# ---------- unggah via git push (v5) ----------
+# ---------- unggah via git push + commit-tree (v5.1) ----------
 
-def git(*args, check=True, timeout=1800):
-    r = subprocess.run(['git', '-C', REPO_DIR] + list(args),
+def git(*args, check=True, timeout=600, input_text=None):
+    r = subprocess.run(['git', '-C', REPO_DIR] + list(args), input=input_text,
                        capture_output=True, text=True, timeout=timeout)
     if check and r.returncode != 0:
         log('git gagal:', args[0], scrub((r.stderr or r.stdout or ''))[-300:])
     return r
 
 def setup_repo():
-    """Clone parsial repo gudang: hanya commit+pohon, tanpa blob berkas."""
+    """Clone parsial repo gudang: hanya commit+pohon, tanpa blob, tanpa checkout, tanpa indeks."""
     if os.path.exists(REPO_DIR):
         shutil.rmtree(REPO_DIR)
     url = f'https://x-access-token:{TOKEN}@github.com/{REPO}.git'
@@ -215,15 +213,12 @@ def setup_repo():
         log('clone parsial gagal:', scrub(r.stderr or '')[-300:]); sys.exit(4)
     git('config', 'user.email', 'github-actions[bot]@users.noreply.github.com')
     git('config', 'user.name', 'github-actions[bot]')
-    # Indeks = pohon HEAD (tanpa mengunduh blob); commit berikutnya memuat
-    # seluruh isi repo lama + berkas baru yang ditambahkan secara eksplisit.
-    if git('read-tree', 'HEAD', check=False).returncode != 0:
-        log('read-tree HEAD gagal'); sys.exit(4)
-    log('repo siap (clone parsial, indeks dari pohon HEAD)')
+    HEAD_NOW['sha'] = git('rev-parse', 'HEAD').stdout.strip()
+    log('repo siap (clone parsial; unggah via commit-tree, tanpa indeks)')
 
 def existing_eps():
     """Episode yang sudah terunggah di repo (untuk resume), dari pohon lokal."""
-    r = git('ls-tree', '--name-only', 'HEAD', '--', WID + '/', check=False)
+    r = git('ls-tree', '--name-only', HEAD_NOW['sha'] or 'HEAD', '--', WID + '/', check=False)
     out = set()
     if r.returncode == 0:
         for line in r.stdout.splitlines():
@@ -231,38 +226,94 @@ def existing_eps():
             if nm.startswith('ep') and nm[2:].isdigit(): out.add(int(nm[2:]))
     return out
 
-def push_with_retry():
+def ls_entries(treeish):
+    """Entri satu pohon/commit: [{mode, type, sha, name}]."""
+    if not treeish: return []
+    r = git('ls-tree', '-z', treeish, check=False)
+    out = []
+    if r.returncode != 0: return out
+    for rec in r.stdout.split('\0'):
+        if not rec: continue
+        meta, name = rec.split('\t', 1)
+        mode, typ, sha = meta.split(' ')
+        out.append({'mode': mode, 'type': typ, 'sha': sha, 'name': name})
+    return out
+
+def mktree(entries):
+    def key(e): return e['name'] + ('/' if e['type'] == 'tree' else '')
+    inp = ''.join(f"{e['mode']} {e['type']} {e['sha']}\t{e['name']}\n"
+                  for e in sorted(entries, key=key))
+    r = git('mktree', '--missing', input_text=inp)  # --missing wajib: clone blobless tak punya blob lama lokal; mktree tanpa itu menolak entri blob yang dirujuk pohon lama (terbukti di uji lokal v5.1)
+    if r.returncode != 0:
+        log('mktree gagal'); sys.exit(4)
+    return r.stdout.strip()
+
+def splice(treeish, parts, leaf):
+    """Ganti/tambah entri di jalur parts dalam pohon treeish; kembalikan sha pohon baru."""
+    entries = ls_entries(treeish)
+    head, rest = parts[0], parts[1:]
+    entries = [e for e in entries if e['name'] != head]
+    if not rest:
+        leaf = dict(leaf); leaf['name'] = head
+        entries.append(leaf)
+        return mktree(entries)
+    sub_sha = next((e['sha'] for e in ls_entries(treeish)
+                    if e['name'] == head and e['type'] == 'tree'), None)
+    new_sub = splice(sub_sha, rest, leaf)
+    entries.append({'mode': '040000', 'type': 'tree', 'sha': new_sub, 'name': head})
+    return mktree(entries)
+
+def push_commit(new_root_tree, msg):
+    parent = HEAD_NOW['sha']
+    r = git('commit-tree', new_root_tree, '-p', parent, '-m', msg)
+    if r.returncode != 0:
+        log('commit-tree gagal'); sys.exit(4)
+    commit = r.stdout.strip()
     for t in range(5):
-        r = git('push', 'origin', 'HEAD:main', check=False)
-        if r.returncode == 0: return
-        log(f'  push gagal (coba {t + 1}/5):', scrub(r.stderr or '')[-200:])
+        rp = git('push', 'origin', f'{commit}:refs/heads/main', check=False, timeout=1800)
+        if rp.returncode == 0:
+            HEAD_NOW['sha'] = commit
+            return commit
+        log(f'  push gagal (coba {t + 1}/5):', scrub(rp.stderr or '')[-200:])
         time.sleep(20 * (t + 1))
     log('push gagal total'); sys.exit(4)
 
 def push_episode(ep):
-    """Satu episode = satu commit + push; kembalikan sha HEAD baru."""
-    src = os.path.join(OUT, f'ep{ep}')
-    dst = os.path.join(REPO_DIR, WID, f'ep{ep}')
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if os.path.exists(dst): shutil.rmtree(dst)
-    shutil.copytree(src, dst)
-    if git('add', '--', f'{WID}/ep{ep}', check=False).returncode != 0:
-        log('git add ep gagal', ep); sys.exit(4)
-    r = git('commit', '-m', f'{WID} episode {ep} (segmen HLS)', check=False)
+    """Satu episode = satu pohon episode + splice ke akar + commit-tree + push."""
+    edir = os.path.join(OUT, f'ep{ep}')
+    ep_entries = []
+    for fn in sorted(os.listdir(edir)):
+        r = git('hash-object', '-w', os.path.join(edir, fn), timeout=900)
+        if r.returncode != 0:
+            log('hash-object gagal', fn); sys.exit(4)
+        ep_entries.append({'mode': '100644', 'type': 'blob', 'sha': r.stdout.strip(), 'name': fn})
+    ep_tree = mktree(ep_entries)
+    root = splice(HEAD_NOW['sha'], [WID, f'ep{ep}'],
+                  {'mode': '040000', 'type': 'tree', 'sha': ep_tree})
+    commit = push_commit(root, f'{WID} episode {ep} (segmen HLS)')
+    log(f'  ep{ep} ter-push ({commit[:7]})')
+    shutil.rmtree(edir, ignore_errors=True)  # hemat disk runner
+    return commit
+
+def push_manifest(pin):
+    manifest = {'wid': WID, 'anilistId': ANILIST, 'name': NAME, 'totalEpisodes': TOTAL,
+                'repo': REPO, 'pin': pin}
+    data = json.dumps(manifest, indent=1).encode()
+    r = subprocess.run(['git', '-C', REPO_DIR, 'hash-object', '-w', '--stdin'],
+                       input=data, capture_output=True, timeout=120)
     if r.returncode != 0:
-        log('git commit ep gagal', ep, scrub((r.stderr or r.stdout or ''))[-300:]); sys.exit(4)
-    push_with_retry()
-    sha = git('rev-parse', 'HEAD').stdout.strip()
-    log(f'  ep{ep} ter-push ({sha[:7]})')
-    shutil.rmtree(dst, ignore_errors=True)   # hemat disk runner; objek sudah di server
-    shutil.rmtree(src, ignore_errors=True)   # unduhan staging juga dibersihkan
-    return sha
+        log('hash-object manifest gagal'); sys.exit(4)
+    blob = r.stdout.decode().strip()
+    root = splice(HEAD_NOW['sha'], ['manifests', f'{WID}.json'],
+                  {'mode': '100644', 'type': 'blob', 'sha': blob})
+    push_commit(root, f'manifest {WID}')
+    print('MANIFEST_PIN', pin, flush=True)
 
 def main():
     setup_repo()
     have = existing_eps()
     if have: log(f'resume: {len(have)} episode sudah ada di repo, dilanjutkan')
-    pin = git('rev-parse', 'HEAD').stdout.strip()
+    pin = HEAD_NOW['sha']
     for ep in range(1, TOTAL + 1):
         if ep in have: continue
         edir = os.path.join(OUT, f'ep{ep}')
@@ -273,18 +324,7 @@ def main():
         if not ok:
             log(f'EP{ep} GAGAL — berhenti (episode yang sudah selesai aman tersimpan di repo)'); sys.exit(3)
         pin = push_episode(ep)
-    manifest = {'wid': WID, 'anilistId': ANILIST, 'name': NAME, 'totalEpisodes': TOTAL,
-                'repo': REPO, 'pin': pin}
-    mdir = os.path.join(REPO_DIR, 'manifests'); os.makedirs(mdir, exist_ok=True)
-    with open(os.path.join(mdir, f'{WID}.json'), 'w') as f:
-        json.dump(manifest, f, indent=1)
-    if git('add', '--', f'manifests/{WID}.json', check=False).returncode != 0:
-        log('git add manifest gagal'); sys.exit(4)
-    r = git('commit', '-m', f'manifest {WID}', check=False)
-    if r.returncode != 0:
-        log('git commit manifest gagal', scrub((r.stderr or r.stdout or ''))[-300:]); sys.exit(4)
-    push_with_retry()
-    print('MANIFEST_PIN', pin, flush=True)
+    push_manifest(pin)
     log(f'SELESAI {WID}: pin {pin[:7]} — menunggu diterbitkan pengawas katalog')
 
 if __name__ == '__main__':
